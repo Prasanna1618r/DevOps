@@ -5,4 +5,3 @@ function add(){
 }
  
 // console.log(total)
-
