@@ -1,173 +1,89 @@
-pipeline {
+pipeline{
     agent none
     
-    environment {
-        DEVELOPER_DIR = "/Applications/Xcode_13.3.app/Contents/Developer"
-        WORKSPACE_DIR = "${env.WORKSPACE}"
-        SCHEME = "hexnodeagent"
-        CONFIGURATION = "Release"
-        EXPORT_OPTIONS_PLIST = "${env.WORKSPACE}/ExportOptions.plist"
-        ARCHIVE_PATH = "${env.WORKSPACE}/build/${SCHEME}.xcarchive"
-        IPA_OUTPUT_PATH = "${env.WORKSPACE}/build"
-        AWS_SHARED_CREDENTIALS_FILE = ''
+    environment{
+        JAVA_HOME = "/usr/lib/jvm/java-11-openjdk-amd64"
         BUILD_TIMESTAMP = "${new Date().format('yyyyMMddHHmmss')}"
     }
-
-    stages {
-        stage('Build App') {
-            agent { label 'mac_mini_kochi' }
-
-            steps {
-
-                /*===============================
-                 Cleaning workspace before build
-                ===============================*/
-                script {
-                    echo "Cleaning workspace..."
-                    deleteDir()
+    tools{
+        gradle 'gradle_6_2_1'
+    }
+    stages{
+        stage('Build'){
+            agent { label 'devopsbuildsrv' }
+            steps{
+                withGradle{
+                    gradleBuildFile = 'build.gradle'
+                    tasks = 'clean assembleRelease bundleRelease'
                 }
                 git branch: params.BRANCH, credentialsId: 'gitlab', url: 'https://gitlab.mitsogo.com/macosapplication/macosagent.git'
-
-
-                /*=============================
-                 Set App version and Build App
-                =============================*/
-                sh '''
-                    #!/bin/bash
-                    set -xe
-                    message() { echo -e "\\n[$(date +\'%Y-%m-%d %H:%M:%S\') $NODE_NAME] $1"; }
-
-                    info_file="hexnodeagentd/Info.plist"
-                    export CFBundleShortVersionString=$(plutil -extract CFBundleShortVersionString xml1 -o - "$info_file"|sed -n \'s/.*<string>\\(.*\\)<\\/string>.*/\\1/p\')
-                    export CFBundleVersion=$(plutil -extract CFBundleVersion xml1 -o - "$info_file"|sed -n \'s/.*<string>\\(.*\\)<\\/string>.*/\\1/p\')
-                    
-                    echo CFBundleVersion=$CFBundleVersion
-                    echo CFBundleShortVersionString=$CFBundleShortVersionString
-                    [ -z $CFBundleVersion ] && exit 1
-                    [ -z $CFBundleShortVersionString ] && exit 1
-                    sleep 5
-
-                    rm -rf /Users/mitsogodevops/Library/Developer/Xcode/DerivedData/hexnodeagentd*
-                    xcode=/Applications/Xcode_13.3.app/Contents/Developer/usr/bin/xcodebuild
-                    export DEVELOPER_DIR=/Applications/Xcode_13.3.app/Contents/Developer
-
-                    /usr/bin/agvtool mvers -terse1
-                    /usr/bin/agvtool vers -terse
-                    /usr/bin/agvtool new-marketing-version $CFBundleShortVersionString
-                    /usr/bin/agvtool new-version -all $CFBundleVersion
-                    /usr/bin/security find-certificate -a -c BX6L6CPUN8 -Z | grep ^SHA-1
-                    $xcode -showsdks
-                    $xcode -list
-                    $xcode -version
-                    /usr/bin/security find-identity -p codesigning -v
-                    
-                    echo "Building App..."
-                    $xcode -scheme hexnodeagent -configuration Release clean build BUILD_DIR=${WORKSPACE}/build DEVELOPMENT_TEAM=BX6L6CPUN8 -allowProvisioningUpdates
-                '''
-            
-                /*=====================================================
-                 pkgbuild, productbuild, notarization and upload to s3
-                =====================================================*/
-                withCredentials([file(credentialsId: 'JENKINS_AWS_CREDENTIALS', variable: 'AWS_SHARED_CREDENTIALS_FILE')]) {
-                sh '''
-                    #!/bin/bash
-                    set +x
-                    set +e
-                    
-                    message() { echo -e "\\n[$(date +\'%Y-%m-%d %H:%M:%S\') $NODE_NAME] $1"; }
-                    
-                    notarization(){
-                        local file="$1"
-                        message "info:notarizing $file"
-                        xcrun notarytool submit "$file" -p notarizationkey --wait
-                        [ $? -ne 0 ] && message "error:while notarizing $file" && exit 1
+                withCredentials([string(credentialsId: 'ANDROID_KEY_PASSPHRASE', variable: 'ANDROID_PASSPHRASE'), file(credentialsId: 'JENKINS_AWS_CREDENTIALS', variable: 'AWS_SHARED_CREDENTIALS_FILE'), string(credentialsId: 'jenkins_proxy', variable: 'PROXY')]) {
+                    step([$class: 'SignApksBuilder', apksToSign: '**/*-unsigned.apk', keyAlias: 'hexnodemdmapp', keyStoreId: '27'])
+                    sh '''#!/bin/bash
+    
+                        message() {
+                            echo "$(date +\'%Y-%m-%d %H:%M:%S\') $(hostname) $1"
+                        }
                         
-                        file=$(echo "$file"| sed \'s/\\.zip$//\') 
-                        message "info:stapling $file"
-                        xcrun stapler staple "$file"
-                        [ $? -ne 0 ] && message "error:while stapling $file" && exit 1
+                        S3_URL="s3://testing-hexnode/jenkins/${JOB_NAME}/${BUILD_ID}"
+                        assist_version=$(grep -A 5 "remoteControl {" $WORKSPACE/app/build.gradle | grep "versionName" | cut -d \'"\' -f2)
+                        remoteview_version=$(grep -A 5 "remoteView {" $WORKSPACE/app/build.gradle | grep "versionName" | cut -d \'"\' -f2)
                         
-                        message "info:verifying notarization"
-                        spctl --assess -vvv --type install "$file"
-                        [ $? -ne 0 ] && message "error:while verifying notarization" && exit 1
-                        [[ "$2" == "zip" ]] && message "info:removing zip file" && rm -rf "$file.zip"
-                    }
-                    export PYTHONWARNINGS=ignore::UserWarning
-
-                    info_file="hexnodeagentd/Info.plist"
-                    export CFBundleShortVersionString=$(plutil -extract CFBundleShortVersionString xml1 -o - "$info_file"|sed -n \'s/.*<string>\\(.*\\)<\\/string>.*/\\1/p\')
-                    export CFBundleVersion=$(plutil -extract CFBundleVersion xml1 -o - "$info_file"|sed -n \'s/.*<string>\\(.*\\)<\\/string>.*/\\1/p\')
-                    
-                    COMMIT_SHA=$(git rev-parse --short HEAD)
-                    [ $? -ne 0 ] && message "error:while fetching commit SHA" && exit 1
-                    message "info:COMMIT_SHA - $COMMIT_SHA"
-                    
-                    message "info:cleaning and setting up workspace"
-                    rm -rf __MACOSX url.txt pkgBuildForAgentd
-                    cp -a /Users/mitsogodevops/pkgBuildForAgentd .
-                    mkdir -p $WORKSPACE/outputs/$BUILD_TIMESTAMP
-                    rm -rf pkgBuildForAgentd/pkgbuild/Root/Library/Application\\ Support/HexnodeMDM/Hexnode\\ UEM\\ Helper.app
-                    
-                    message "info:notarizing Hexnode\\ UEM\\ Helper.app"
-                    cd $WORKSPACE/build/Release/
-                    zip -r -y Hexnode\\ UEM\\ Helper.app.zip Hexnode\\ UEM\\ Helper.app
-                    notarization "Hexnode UEM Helper.app.zip" "zip"
-                    cd $WORKSPACE
-                    
-                    mv $WORKSPACE/build/Release/hexnodeagentd $WORKSPACE/pkgBuildForAgentd/pkgbuild/Root/Library/Application\\ Support/HexnodeMDM/hexnodeagentd 
-                    mv $WORKSPACE/build/Release/Hexnode\\ UEM\\ Helper.app $WORKSPACE/pkgBuildForAgentd/pkgbuild/Root/Library/Application\\ Support/HexnodeMDM/
-                    
-                    message "info:running package build for the file"
-                    pkgbuild --root pkgBuildForAgentd/pkgbuild/Root --identifier com.hexnode.hexnodeagentd --install-location / --version ${CFBundleShortVersionString} --scripts pkgBuildForAgentd/Scripts --sign \'Developer ID Installer: Mitsogo Inc (BX6L6CPUN8)\' --component-plist pkgBuildForAgentd/pkgbuild/component.plist  pkgBuildForAgentd/Build/hexnodeagentd.pkg
-                    [ $? -ne 0 ] && message "error:during package build" && exit 1
-                    
-                    message "info:running product build"
-                    productbuild --resources pkgBuildForAgentd/productbuild/Resources --package pkgBuildForAgentd/Build/hexnodeagentd.pkg --product pkgBuildForAgentd/productbuild/Requirements.plist --sign \'Developer ID Installer: Mitsogo Inc (BX6L6CPUN8)\' pkgBuildForAgentd/DistributionPkg/hexnodeagentd.pkg
-                    [ $? -ne 0 ] && message "error:during product build" && exit 1
-                    
-                    message "info:notarizing hexnodeagentd.pkg"
-                    notarization "pkgBuildForAgentd/DistributionPkg/hexnodeagentd.pkg"
-                    
-                    mv pkgBuildForAgentd/DistributionPkg/hexnodeagentd.pkg $WORKSPACE/outputs/$BUILD_TIMESTAMP/
-                    rm -rf $WORKSPACE/build/Release/ 
-                    cd $WORKSPACE/outputs/${BUILD_TIMESTAMP}/
-                    
-                    S3_PATH="s3://testing-hexnode/jenkins/$JOB_NAME/$BUILD_ID"
-                    message "info:uploading hexnodeagentd.pkg and files to S3"
-                    sha256sum hexnodeagentd.pkg|awk \'{print $1}\' > hexnodeagentd.pkg.checksum 
-
-                    aws s3 cp hexnodeagentd.pkg ${S3_PATH}/HexnodeAgentd.pkg --profile testing-hexnode --no-progress  --acl public-read && 
-                    aws s3 cp hexnodeagentd.pkg ${S3_PATH}/${COMMIT_SHA}_HexnodeAgentd-$CFBundleShortVersionString.pkg --profile testing-hexnode --acl public-read --no-progress &&
-                    aws s3 cp hexnodeagentd.pkg.checksum ${S3_PATH}/HexnodeAgentd.pkg.checksum --profile testing-hexnode --no-progress
-                    [ $? -ne 0 ] && message "error:while uploading hexnodeagentd.pkg to S3" && exit 1
-
-                    message "info:s3 url for HexnodeAgentd.pkg"
-                    echo "https://testing-hexnode.s3.eu-central-1.amazonaws.com/jenkins/$JOB_NAME/$BUILD_ID/HexnodeAgentd.pkg" > "$WORKSPACE/url.txt"
-
-                    message "info:app urls"
-                    cat $WORKSPACE/url.txt
-                '''
-
-                /*=========================
-                 Create test manifest file
-                =========================*/
-                script {
-                    build job: 'DEPLOY_MACOS/DEPLOY_MACOS_CREATE_MANIFESTURL_AGENTD', parameters: [
-                        string(name: 'PKG_URL', value: "testing-hexnode/jenkins/${env.JOB_NAME}/${env.BUILD_ID}/HexnodeAgentd.pkg"),
-                        string(name: 'MANIFEST_URL', value: "testing-hexnode/jenkins/${env.JOB_NAME}/${env.BUILD_ID}/HexnodeAgentd.xml")
-                    ]
-                }
-                sh '''
-                    #!/bin/bash
-                    set +xe
-                    message() { echo -e "\\n[$(date +\'%Y-%m-%d %H:%M:%S\') $NODE_NAME] $1"; }
-                    message "info:manifest url"
-                    echo "https://testing-hexnode.s3.eu-central-1.amazonaws.com/jenkins/${JOB_NAME}/${BUILD_ID}/HexnodeAgentd.xml"
-                '''
+                        COMMIT_SHA=$(git rev-parse --short HEAD)
+                        echo "urls for the build:" > $WORKSPACE/url.txt
+                        
+                        if [[ $APK_ACTION == *"HEXNODEREMOTEVIEW"* ]]; then
+                           echo "info: remoteview_version : ${remoteview_version}"
+                           aws s3 cp $WORKSPACE/app/build/outputs/apk/remoteView/release/app-remoteView-release.apk "${S3_URL}/${COMMIT_SHA}_hexnoderemoteview_${remoteview_version}.apk" --region eu-central-1 --profile testing-hexnode --no-progress
+                           exitcode=$?
+                           if [ $exitcode -ne 0 ];then
+                                echo "critical:failed copying files to s3"
+                                exit 1
+                           else
+                                echo "info:successfully copied files to s3"
+                           fi
+                           aws s3 presign "${S3_URL}/${COMMIT_SHA}_hexnoderemoteview_${remoteview_version}.apk" --expires-in 604800 --region eu-central-1 --profile testing-hexnode >> $WORKSPACE/url.txt
+                        fi
+                        
+                        if [[ $APK_ACTION == *"HEXNODEASSIST-APK"* ]]; then
+                           echo "info: hexnode assist version: ${assist_version}"
+                           aws s3 cp $WORKSPACE/app/build/outputs/apk/remoteControl/release/app-remoteControl-release.apk "${S3_URL}/${COMMIT_SHA}_hexnodeassist_${assist_version}.apk" --region eu-central-1 --profile testing-hexnode --no-progress
+                           exitcode=$?
+                           if [ $exitcode -ne 0 ];then
+                                echo "critical:failed copying files to s3"
+                                exit 1
+                           else
+                                echo "info:successfully copied files to s3"
+                           fi
+                           aws s3 presign "${S3_URL}/${COMMIT_SHA}_hexnodeassist_${assist_version}.apk" --expires-in 604800 --region eu-central-1 --profile testing-hexnode >> $WORKSPACE/url.txt
+                        fi
+                        
+                        if [[ $APK_ACTION == *"HEXNODEASSIST-AAB"* ]]; then
+                            mkdir -p $WORKSPACE/version/remoteassist
+                            jarsigner -keystore $JENKINS_WORKDIR/certificate.jks $WORKSPACE/app/build/outputs/bundle/remoteControlRelease/app-remoteControl-release.aab hexnodemdmapp -storepass $ANDROID_PASSPHRASE
+                            exitcode=$?
+                            if [ $exitcode -ne 0 ]; then
+                                echo "critical: failed building aab signing"
+                                exit 2
+                            else
+                                echo "info: successfully signed aab hexnodeassist.aab"
+                            fi
+                            aws s3 cp $WORKSPACE/app/build/outputs/bundle/remoteControlRelease/app-remoteControl-release.aab "${S3_URL}/${COMMIT_SHA}_hexnodeassist_${assist_version}.aab" --region eu-central-1 --profile testing-hexnode --no-progress
+                            exitcode=$?
+                            if [ $exitcode -ne 0 ];then
+                                 echo "critical:failed copying files to s3"
+                                 exit 1
+                            else
+                                 echo "info:successfully copied files to s3"
+                            fi
+                            aws s3 presign "${S3_URL}/${COMMIT_SHA}_hexnodeassist_${assist_version}.aab" --expires-in 604800 --region eu-central-1 --profile testing-hexnode >> $WORKSPACE/url.txt
+                        fi
+                        
+                        cat $WORKSPACE/url.txt
+                        '''
                 }
             }
         }
-
         stage('Approve Deployment'){
             agent none
             steps {
@@ -187,30 +103,139 @@ pipeline {
                 )
             }
         }
-
         stage('Deploy'){
-            agent{ label 'devops_job_runner'}
+            agent { label 'devops_job_runner'}
             steps{
-                sh '''
-                    #!/bin/bash
-                    set +xe
-                    message() { echo -e "\\n[$(date +\'%Y-%m-%d %H:%M:%S\') $NODE_NAME] $1"; }
-                    message "info:manifest url"
-                    echo "https://downloads.hexnode.com/macos-manifesturl/v2/HexnodeAgentd.xml"
-                '''
-            }
-        }
-    }
-    post {
-        always {
-            script {
-                node('devops_job_runner') {
-                    echo 'Cleaning workspace...'
-                    deleteDir()
-                }
-                node('mac_mini_kochi') {
-                    echo 'Cleaning workspace...'
-                    deleteDir()
+                git branch: params.BRANCH, credentialsId: 'gitlab', url: 'https://gitlab.mitsogo.com/macosapplication/macosagent.git'
+                withCredentials([file(credentialsId: 'JENKINS_AWS_CREDENTIALS', variable: 'AWS_SHARED_CREDENTIALS_FILE'), string(credentialsId: 'jenkins_proxy', variable: 'PROXY')]) {
+                    // sh '''#!/bin/bash
+                    //     rm -rf $WORKSPACE/version
+                    //     mkdir -p $WORKSPACE/version/remoteview $WORKSPACE/version/remoteassist
+                    //     message() {
+                    //         echo "$(date +\'%Y-%m-%d %H:%M:%S\') $(hostname) $1"
+                    //     }
+                    //     export https_proxy=${PROXY}
+                    //     BUILD_S3_URL="s3://testing-hexnode/jenkins/$JOB_NAME/$BUILD_ID"
+                    //     DEPLOY_S3_URL="s3://downloads.hexnode.com/testing"
+                    //     invalidation_apps=()
+                    //     [ -z $BUILDJOB_ID ] && message "error: BUILDJOB_ID not provided or empty" && exit 1
+                    //     echo "urls for the deploy:" > $WORKSPACE/url.txt
+                        
+                    //     if [[ $APK_ACTION == *"HEXNODEREMOTEVIEW"* ]]; then
+                    //         message "info: deploying hexnoderemoteview.apk from s3"
+                        
+                    //         file=$(aws s3 ls "${BUILD_S3_URL}/" --profile testing-hexnode --region eu-central-1 | grep "_hexnoderemoteview_.*\\.apk" | awk \'{print $NF}\')
+                    //         if [[ -z "$file" ]]; then
+                    //             message "error: hexnoderemoteview.apk not found in S3"
+                    //             exit 1
+                    //         fi
+                    //         message "info:Using $file"
+                    //         aws s3 cp "${BUILD_S3_URL}/${file}" "$WORKSPACE/version/remoteview/${file}" --profile testing-hexnode --region eu-central-1 --no-progress
+                    //         if [ $? -ne 0 ] || ! [ -f "$WORKSPACE/version/remoteview/${file}" ]; then
+                    //             message "critical: downloading "{$BUILD_S3_URL}/${file}" failed"
+                    //             exit 1
+                    //         fi    
+                    //         aws s3 cp "$DEPLOY_S3_URL/hexnoderemoteview.apk" "$DEPLOY_S3_URL/version/backups/$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 && \\ 
+                    //         aws s3 cp "$DEPLOY_S3_URL/hexnoderemoteview.apk.checksum" "$DEPLOY_S3_URL/version/backups/$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 && \\
+                    //         aws s3 cp "$DEPLOY_S3_URL/hexnoderemoteview.apk" "$DEPLOY_S3_URL/version/backups//$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 && \\
+                    //         aws s3 cp "$DEPLOY_S3_URL/hexnoderemoteview.apk.checksum" "$DEPLOY_S3_URL/version/backups/$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 
+                    //         if [ $? -ne 0 ];then
+                    //           message "critacal: error backup failed for remoteview"
+                    //           exit 1
+                    //         fi
+                    //         sha256sum $WORKSPACE/version/remoteview/${file} | awk \'{print $1}\' > $WORKSPACE/version/remoteview/${file}.checksum
+                    //         aws s3 cp "$WORKSPACE/version/remoteview/${file}" "$DEPLOY_S3_URL/hexnoderemoteview.apk" --profile jenkins --region us-east-1 --acl public-read --no-progress && aws s3 cp "$WORKSPACE/version/remoteview/${file}.checksum" "$DEPLOY_S3_URL/hexnoderemoteview.apk.checksum" --profile jenkins --region us-east-1 --acl public-read --no-progress && \\
+                    //         aws s3 cp "$WORKSPACE/version/remoteview/${file}" "$DEPLOY_S3_URL/Hexnoderemoteview.apk" --profile jenkins --region us-east-1 --acl public-read --no-progress && aws s3 cp "$WORKSPACE/version/remoteview/${file}.checksum" "$DEPLOY_S3_URL/Hexnoderemoteview.apk.checksum" --profile jenkins --region us-east-1 --acl public-read --no-progress && \\
+                    //         aws s3 cp "$WORKSPACE/version/remoteview/${file}" "$DEPLOY_S3_URL/version/remoteview/" --profile jenkins --region us-east-1  --no-progress && aws s3 cp "$WORKSPACE/version/remoteview/${file}.checksum" "$DEPLOY_S3_URL/version/remoteview/" --profile jenkins --region us-east-1  --no-progress
+                    //         exitcode=$?
+                    //         if [ $exitcode -eq 0 ];then
+                    //           message "info:successfully uploaded files to s3 https://downloads.hexnode.com/hexnoderemoteview.apk bucket"
+                    //           invalidation_apps+=("/hexnoderemoteview.apk" "/hexnoderemoteview.apk.checksum" "/Hexnoderemoteview.apk" "/Hexnoderemoteview.apk.checksum")   
+                    //           echo "hexnoderemoteview URLs:" >> "$WORKSPACE/url.txt"
+                    //           echo "https://downloads.hexnode.com/hexnoderemoteview.apk" >> "$WORKSPACE/url.txt"
+                    //           echo "https://downloads.hexnode.com/hexnoderemoteview.apk.checksum" >> "$WORKSPACE/url.txt"
+                    //           echo "https://downloads.hexnode.com/Hexnoderemoteview.apk" >> "$WORKSPACE/url.txt"
+                    //           echo "https://downloads.hexnode.com/Hexnoderemoteview.apk.checksum" >> "$WORKSPACE/url.txt"
+                    //         else
+                    //           message "critical: upload file ${file} to s3 https://downloads.hexnode.com/hexnoderemoteview.apk bucket failed"
+                    //           exit 1
+                    //         fi
+                    //     fi
+                         
+                    //     if [[ $APK_ACTION == *"HEXNODEASSIST-APK"* ]]; then
+                    //         message "info: downloading hexnodeassist.apk"
+                    //         file=$(aws s3 ls "${BUILD_S3_URL}/" --profile testing-hexnode --region eu-central-1 | grep "_hexnodeassist_.*\\.apk" | awk \'{print $NF}\')
+                    //         if [[ -z "$file" ]]; then
+                    //             message "error: hexnodeassist.apk not found in S3"
+                    //             exit 1
+                    //         fi
+                    //         message "info:Using $file"
+                    //         aws s3 cp "${BUILD_S3_URL}/${file}" "$WORKSPACE/version/remoteassist/${file}" --profile testing-hexnode --region eu-central-1 --no-progress
+                    //         if [ $? -ne 0 ] || ! [ -f "$WORKSPACE/version/remoteassist/${file}" ]; then
+                    //             message "critical: downloading "{$BUILD_S3_URL}/${file}" failed"
+                    //             exit 1
+                    //         fi 
+                            
+                    //         aws s3 cp "$DEPLOY_S3_URL/hexnodeassist.apk" "$DEPLOY_S3_URL/version/backups/$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 && \\ 
+                    //         aws s3 cp "$DEPLOY_S3_URL/hexnodeassist.apk.checksum" "$DEPLOY_S3_URL/version/backups/$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 && \\
+                    //         aws s3 cp "$DEPLOY_S3_URL/Hexnodeassist.apk" "$DEPLOY_S3_URL/version/backups/$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 && \\
+                    //         aws s3 cp "$DEPLOY_S3_URL/Hexnodeassist.apk.checksum" "$DEPLOY_S3_URL/version/backups/$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 
+                    //         if [ $? -ne 0 ];then
+                    //           message "critacal: error backup failed for hexnodeassist.apk"
+                    //           exit 1
+                    //         fi
+                    //         sha256sum $WORKSPACE/version/remoteassist/${file} | awk \'{print $1}\' > $WORKSPACE/version/remoteassist/${file}.checksum
+                    //         aws s3 cp "$WORKSPACE/version/remoteassist/${file}" "$DEPLOY_S3_URL/hexnodeassist.apk" --profile jenkins --region us-east-1 --acl public-read --no-progress && aws s3 cp "$WORKSPACE/version/remoteassist/${file}.checksum" "$DEPLOY_S3_URL/hexnodeassist.apk.checksum" --profile jenkins --region us-east-1 --acl public-read --no-progress && \\
+                    //         aws s3 cp "$WORKSPACE/version/remoteassist/${file}" "$DEPLOY_S3_URL/Hexnodeassist.apk" --profile jenkins --region us-east-1 --acl public-read --no-progress && aws s3 cp "$WORKSPACE/version/remoteassist/${file}.checksum" "$DEPLOY_S3_URL/Hexnodeassist.apk.checksum" --profile jenkins --region us-east-1 --acl public-read --no-progress && \\
+                    //         aws s3 cp "$WORKSPACE/version/remoteassist/${file}" "$DEPLOY_S3_URL/version/remoteassist/" --profile jenkins --region us-east-1  --no-progress && aws s3 cp "$WORKSPACE/version/remoteassist/${file}.checksum" "$DEPLOY_S3_URL/version/remoteassist/" --profile jenkins --region us-east-1  --no-progress
+                    //         exitcode=$?
+                    //         if [ $exitcode -eq 0 ];then
+                    //           message "info:successfully uploaded files to s3 https://downloads.hexnode.com/hexnodeassist.apk bucket"
+                    //           invalidation_apps+=("/hexnodeassist.apk" "/hexnodeassist.apk.checksum" "/Hexnodeassist.apk" "/Hexnodeassist.apk.checksum")
+                    //           echo "hexnodeassist APK URLs:" >> "$WORKSPACE/url.txt"
+                    //           echo "https://downloads.hexnode.com/hexnodeassist.apk" >> "$WORKSPACE/url.txt"
+                    //           echo "https://downloads.hexnode.com/hexnodeassist.apk.checksum" >> "$WORKSPACE/url.txt"
+                    //         else
+                    //           message "critical: upload file ${file} to s3 https://downloads.hexnode.com/hexnodeassist.apk bucket failed"
+                    //           exit 1
+                    //         fi
+                    //     fi
+                         
+                    //     if [[ $APK_ACTION == *"HEXNODEASSIST-AAB"* ]]; then
+                    //         message "info: downloading hexnodeassist.aab"
+                    //         file=$(aws s3 ls "${BUILD_S3_URL}/" --profile testing-hexnode --region eu-central-1 | grep "_hexnodeassist_.*\\.aab" | awk \'{print $NF}\')
+                    //         if [[ -z "$file" ]]; then
+                    //             message "error: hexnodeassist.aab not found in S3"
+                    //             exit 1
+                    //         fi
+                    //         aws s3 cp "$DEPLOY_S3_URL/hexnodeassist.aab" "$DEPLOY_S3_URL/version/backups/$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 && \\ 
+                    //         aws s3 cp "$DEPLOY_S3_URL/hexnodeassist.aab.checksum" "$DEPLOY_S3_URL/version/backups/$JOB_NAME/${BUILD_TIMESTAMP}/" --profile jenkins --region us-east-1 
+                    //         if [ $? -ne 0 ];then
+                    //           message "critical: error backup failed for hexnodeassist.aab"
+                    //           exit 1
+                    //         fi
+                    //         message "info:Using $file"
+                    //         aws s3 cp "${BUILD_S3_URL}/${file}" "$WORKSPACE/version/remoteassist/${file}" --profile testing-hexnode --region eu-central-1 --no-progress
+                    //         if [ $? -ne 0 ] || ! [ -f "$WORKSPACE/version/remoteassist/${file}" ]; then
+                    //             message "critical: downloading "{$BUILD_S3_URL}/${file}" failed"
+                    //             exit 1
+                    //         fi 
+                            
+                    //         sha256sum $WORKSPACE/version/remoteassist/${file} | awk \'{print $1}\' > $WORKSPACE/version/remoteassist/${file}.checksum
+                    //         aws s3 cp "$WORKSPACE/version/remoteassist/${file}" "$DEPLOY_S3_URL/hexnodeassist.aab" --profile jenkins --region us-east-1  --no-progress && aws s3 cp "$WORKSPACE/version/remoteassist/${file}.checksum" "$DEPLOY_S3_URL/hexnodeassist.aab.checksum" --profile jenkins --region us-east-1  --no-progress && \\
+                    //         aws s3 cp "$WORKSPACE/version/remoteassist/${file}" "$DEPLOY_S3_URL/version/remoteassist/" --profile jenkins --region us-east-1 --no-progress && aws s3 cp "$WORKSPACE/version/remoteassist/${file}.checksum" "$DEPLOY_S3_URL/version/remoteassist/" --profile jenkins --region us-east-1 --no-progress
+                    //         exitcode=$?
+                    //         if [ $exitcode -eq 0 ];then
+                    //           message "info:successfully uploaded files to s3 https://downloads.hexnode.com/hexnodeassist.aab bucket"
+                    //           echo "hexnodeassist.aab presigned URL: $(aws s3 presign s3://downloads.hexnode.com/hexnodeassist.aab --expires-in 259200 --region us-east-1 --profile jenkins)" >> "$WORKSPACE/url.txt"
+                    //         else
+                    //           message "critical: upload file ${file} to s3 https://downloads.hexnode.com/hexnodeassist.aab bucket failed"
+                    //           exit 1
+                    //         fi
+                    //     fi
+                    //     export https_proxy=${PROXY}
+                    //     cat $WORKSPACE/url.txt
+                    //     '''
                 }
             }
         }
