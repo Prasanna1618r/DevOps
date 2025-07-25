@@ -14,39 +14,49 @@ pipeline{
                 ANDROID_ZIPALIGN = "${ANDROID_HOME}/build-tools/34.0.0/zipalign"
             }
             steps{
+                
+                /*===============================
+                 Cleaning workspace before build
+                ===============================*/
                 script {
                     echo "Cleaning workspace..."
                     deleteDir()
                 }
+                
                 git branch: params.BRANCH, credentialsId: 'gitlab', url: 'https://gitlab.mitsogo.com/android/remotecontrolagent.git'
                 withCredentials([string(credentialsId: 'ANDROID_KEY_PASSPHRASE', variable: 'ANDROID_PASSPHRASE'), file(credentialsId: 'JENKINS_AWS_CREDENTIALS', variable: 'AWS_SHARED_CREDENTIALS_FILE'), string(credentialsId: 'jenkins_proxy', variable: 'PROXY')]) {
+                    
+                    /*=============================
+                        Build the Unsigned App
+                    =============================*/
+                    
                     withGradle{
                         sh 'gradle clean assembleRelease bundleRelease'
                     }
+                    
+                    /*=============================
+                          Signing the App
+                    =============================*/
+                    
                     sh '''
                         sign_and_align_apk() {
                            unsigned_apk="$1"
                            aligned_apk="$2"
                            signed_apk="$3"
                            app_name="$4"
-                           chmod +r "$unsigned_apk"
+                           
                            echo "Signing $app_name APK..."
-                           APK_INPUT="$aligned_apk"
-                           APK_OUTPUT="$signed_apk"
-                           KEYSTORE="$JENKINS_WORKDIR/certificate.jks"
-                           ALIAS="hexnodemdmapp"
-                           STORE_PASS="$ANDROID_PASSPHRASE"
-                           KEY_PASS="$ANDROID_PASSPHRASE"
-                           echo $unsigned_apk,$signed_apk1
+                           
                            "$ANDROID_ZIPALIGN" -v -p 4 "$unsigned_apk" "$aligned_apk"
-                           # ls "/home/devops/workspace/TEST_DEPLOY_ANDROID_HEXNODE_REMOTEVIEW_AND_REMOTEASSIST_APP_PIPELINE/app/build/outputs/apk/remoteControl/release/"
+                           
                            apksigner sign \
-                             --ks "$KEYSTORE" \
-                             --ks-key-alias "$ALIAS" \
-                             --ks-pass pass:$STORE_PASS \
-                             --key-pass pass:$KEY_PASS \
-                             --out "$APK_OUTPUT" \
-                             "$APK_INPUT"
+                             --ks "$JENKINS_WORKDIR/certificate.jks" \
+                             --ks-key-alias "hexnodemdmapp" \
+                             --ks-pass pass:$ANDROID_PASSPHRASE \
+                             --key-pass pass:$ANDROID_PASSPHRASE \
+                             --out "$signed_apk" \
+                             "$aligned_apk"
+                             
                            if [ $? -ne 0 ]; then
                                echo "critical: failed to sign $app_name APK"
                                exit 1
@@ -55,14 +65,14 @@ pipeline{
                            
                         }
                         
-                        if [ $APK_ACTION = "HEXNODEASSIST-APK" ]; then
+                        if echo "$APK_ACTION" | grep -iq 'HEXNODEASSIST-APK'; then
                            sign_and_align_apk \
                                "$WORKSPACE/app/build/outputs/apk/remoteControl/release/app-remoteControl-release-unsigned.apk" \
                                "$WORKSPACE/app/build/outputs/apk/remoteControl/release/app-remoteControl-release-aligned.apk" \
                                "$WORKSPACE/app/build/outputs/apk/remoteControl/release/app-remoteControl-release.apk" \
                                "Hexnode Assist"
                         fi
-                        if [ $APK_ACTION = "HEXNODEREMOTEVIEW" ]; then
+                        if echo "$APK_ACTION" | grep -iq 'HEXNODEREMOTEVIEW'; then
                            sign_and_align_apk \
                                "$WORKSPACE/app/build/outputs/apk/remoteView/release/app-remoteView-release-unsigned.apk" \
                                "$WORKSPACE/app/build/outputs/apk/remoteView/release/app-remoteView-release-aligned.apk" \
@@ -70,8 +80,13 @@ pipeline{
                                "Hexnode RemoteView"
                         fi
                     '''
+                    
+                    
+                    /*=============================
+                          Verify the signing
+                    =============================*/
+                    
                     sh '''
-                            # Function to check APK signature
                             check_apk_signature() {
                                local apk_path="$1"
                                echo "Checking APK signing..." 
@@ -87,16 +102,22 @@ pipeline{
                                fi
                             }
                             
-                            # Run signature checks based on APK_ACTION
-                            if [ $APK_ACTION = "HEXNODEASSIST-APK" ]; then
+                            if echo "$APK_ACTION" | grep -iq 'HEXNODEASSIST-APK'; then
                                check_apk_signature "$WORKSPACE/app/build/outputs/apk/remoteControl/release/app-remoteControl-release.apk"
                             fi
-                            if [ $APK_ACTION = "HEXNODEREMOTEVIEW" ]; then
+                            if echo "$APK_ACTION" | grep -iq 'HEXNODEREMOTEVIEW'; then
                                check_apk_signature "$WORKSPACE/app/build/outputs/apk/remoteView/release/app-remoteView-release.apk"
                             fi
                             
                         '''
+                        
+                    /*====================================
+                     Build App and copy the url in url.txt
+                    =======================================*/    
+                        
                     sh '''#!/bin/bash
+                        set +x
+                        set +e
     
                         message() {
                             echo "$(date +\'%Y-%m-%d %H:%M:%S\') $(hostname) $1"
@@ -109,7 +130,7 @@ pipeline{
                         COMMIT_SHA=$(git rev-parse --short HEAD)
                         echo "urls for the build:" > $WORKSPACE/url.txt
                         
-                        if [[ $APK_ACTION == *"HEXNODEREMOTEVIEW"* ]]; then
+                        if echo "$APK_ACTION" | grep -iq 'HEXNODEREMOTEVIEW'; then
                            echo "info: remoteview_version : ${remoteview_version}"
                            aws s3 cp $WORKSPACE/app/build/outputs/apk/remoteView/release/app-remoteView-release.apk "${S3_URL}/${COMMIT_SHA}_hexnoderemoteview_${remoteview_version}.apk" --region eu-central-1 --profile testing-hexnode --no-progress
                            exitcode=$?
@@ -122,7 +143,7 @@ pipeline{
                            aws s3 presign "${S3_URL}/${COMMIT_SHA}_hexnoderemoteview_${remoteview_version}.apk" --expires-in 604800 --region eu-central-1 --profile testing-hexnode >> $WORKSPACE/url.txt
                         fi
                         
-                        if [[ $APK_ACTION == *"HEXNODEASSIST-APK"* ]]; then
+                        if echo "$APK_ACTION" | grep -iq 'HEXNODEASSIST-APK'; then
                            echo "info: hexnode assist version: ${assist_version}"
                            aws s3 cp $WORKSPACE/app/build/outputs/apk/remoteControl/release/app-remoteControl-release.apk "${S3_URL}/${COMMIT_SHA}_hexnodeassist_${assist_version}.apk" --region eu-central-1 --profile testing-hexnode --no-progress
                            exitcode=$?
@@ -135,7 +156,7 @@ pipeline{
                            aws s3 presign "${S3_URL}/${COMMIT_SHA}_hexnodeassist_${assist_version}.apk" --expires-in 604800 --region eu-central-1 --profile testing-hexnode >> $WORKSPACE/url.txt
                         fi
                         
-                        if [[ $APK_ACTION == *"HEXNODEASSIST-AAB"* ]]; then
+                        if echo "$APK_ACTION" | grep -iq 'HEXNODEASSIST-AAB'; then
                             mkdir -p $WORKSPACE/version/remoteassist
                             jarsigner -keystore $JENKINS_WORKDIR/certificate.jks $WORKSPACE/app/build/outputs/bundle/remoteControlRelease/app-remoteControl-release.aab hexnodemdmapp -storepass $ANDROID_PASSPHRASE
                             exitcode=$?
@@ -159,6 +180,32 @@ pipeline{
                         cat $WORKSPACE/url.txt
                         '''
                         
+                    /*=================================================
+                    Send Mail to QA team to test and Approve deployment
+                    ==================================================*/    
+                        
+                    script {
+                        emailext(
+                            from: "Jenkins Server <jenkins@hexnodemdmnotifications.com>",
+                            to: "QA-Leads@mitsogo.com",
+                            subject: "Approve Deployment For HEXNODE REMOTEVIEW AND REMOTEASSIST APP",
+                            body: """
+                                <p>Hi Team,</p>
+                                <p>Please check and approve the deployment of HEXNODE REMOTEVIEW AND REMOTEASSIST APP </p>
+                                <ul>
+                                    <li>Branch Name  - ${params.BRANCH}</li>
+                                    <li>RemoteView Application  -  <a href='https://testing-hexnode.s3.eu-central-1.amazonaws.com/jenkins/$JOB_NAME/$BUILD_ID/HexnodeAgentd.pkg'>HexnodeAgentd.pkg</a></li>
+                                    <li>RemoteAssist Application -  <a href='https://testing-hexnode.s3.eu-central-1.amazonaws.com/jenkins/${env.JOB_NAME}/${env.BUILD_ID}/HexnodeAgentd.xml'>HexnodeAgentd.xml</a></li>
+                                    <li>RemoteAssist AAB -  <a href='https://testing-hexnode.s3.eu-central-1.amazonaws.com/jenkins/${env.JOB_NAME}/${env.BUILD_ID}/HexnodeAgentd.xml'>HexnodeAgentd.xml</a></li>
+                                    <li>Jenkins Job  -  <a href='${env.JOB_URL}'>${env.JOB_NAME}</a></li>
+                                    <li><b>Approve the deployment</b> <a href='${env.JOB_URL}${env.BUILD_ID}/console'> Here</a></li>
+                                </ul><br/>
+                                <p>Regards,<br/>Jenkins Pipeline<br/>
+                                <a href="https://jenkins.mitsogo.com/">jenkins.mitsogo.com</a></p>
+                            """,
+                            mimeType: 'text/html'
+                        )
+                    }
                 }
             }
         }
